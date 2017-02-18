@@ -106,7 +106,10 @@ def pull(group, command, *, xz):
         command = re.sub(r'\{\}', tf.name, command)
         with tarfile.open(tf.name, mode) as tar:
             for path in paths:
-                tar.add(path.strip())
+                try:
+                    tar.add(path.strip())
+                except FileNotFoundError:
+                    continue
         os.system(command)
 
 
