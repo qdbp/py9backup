@@ -3,6 +3,7 @@
 Dead simple backup functionality.
 '''
 from collections import defaultdict
+from datetime import date
 import os
 import os.path as osp
 from pathlib import Path
@@ -282,7 +283,8 @@ def del_files(group, regex):
 @click.option(
     '--no-xz', default=False, is_flag=True, help='turn off xz compression',
 )
-def pull(group, command, *, no_xz):
+@click.option('--name', default=None, help='name to use for the tarball')
+def pull(group, command, *, no_xz, name):
     '''
     Pulls files into tarball, runs given command.
 
@@ -292,23 +294,27 @@ def pull(group, command, *, no_xz):
     rsync, scp, git push, etc. are good candidate commands here.
     '''
 
-    mode = 'w' if no_xz else 'w:xz'
-    suf = '.tar' if no_xz else '.tar.xz'
-    paths = gather_effective_files(get_group_rps(group))
+    if name is None:
+        name = f'backup_{group}_{date.today().isoformat()}'
 
-    with tmp.NamedTemporaryFile(suffix=suf, delete=True) as tf:
-        command = re.sub(r'\{\}', tf.name, command)
+    tar_mode = 'w' if no_xz else 'w:xz'
+    suf = 'tar' if no_xz else 'tar.xz'
 
-        with tarfile.open(tf.name, mode) as tar:
-            for path in paths:
-                try:
-                    tar.add(path.strip())
-                except FileNotFoundError:
-                    print(f'File {path} not found, skipping.', file=sys.stderr)
-                except PermissionError:
-                    die(f'File {path} needs elevated permissions. Dying.')
+    file_paths = gather_effective_files(get_group_rps(group))
+    tar_fn = osp.join(tmp.mkdtemp(), f'{name}.{suf}')
+    command = re.sub(r'\{\}', tar_fn, command)
 
-        os.system(command)
+    with tarfile.open(tar_fn, tar_mode) as tar:
+        for path in file_paths:
+            try:
+                tar.add(path.strip())
+            except FileNotFoundError:
+                print(f'File {path} not found, skipping.', file=sys.stderr)
+            except PermissionError:
+                die(f'File {path} needs elevated permissions. Dying.')
+
+    os.system(command)
+    os.remove(tar_fn)
 
 
 @click.command('list')
