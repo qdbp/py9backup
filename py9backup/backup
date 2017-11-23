@@ -2,18 +2,19 @@
 '''
 Dead simple backup functionality.
 '''
-from collections import defaultdict
-from datetime import date
 import os
 import os.path as osp
-from pathlib import Path
 import re
-from shutil import copy as fcopy
 import string
 import sys
 import tarfile
 import tempfile as tmp
-from typing import List, Optional
+from collections import defaultdict
+from datetime import date
+from pathlib import Path
+from shutil import copy as fcopy
+from shutil import rmtree
+from typing import List
 
 import click
 
@@ -139,6 +140,7 @@ def commit_group_rps(group, rps):
                 print(rp, file=tf)
 
     fcopy(tfn, str(fp))
+    os.remove(tfn)
 
 
 def gather_effective_files(rps):
@@ -265,7 +267,7 @@ def show_files(group, *, full):
 def del_files(group, regex):
     '''
     Removes files from group by regex.
-    
+
     Python's `re.match` is used, so the regexp should match from the
     beginning of the path. Use ^.* or similar.
     '''
@@ -279,7 +281,7 @@ def del_files(group, regex):
 
 @click.command()
 @click.argument('group')
-@click.argument('command')
+@click.argument('command', nargs=-1)
 @click.option(
     '--no-xz', default=False, is_flag=True, help='turn off xz compression',
 )
@@ -301,7 +303,8 @@ def pull(group, command, *, no_xz, name):
     suf = 'tar' if no_xz else 'tar.xz'
 
     file_paths = gather_effective_files(get_group_rps(group))
-    tar_fn = osp.join(tmp.mkdtemp(), f'{name}.{suf}')
+    temp_dir = tmp.mkdtemp()
+    tar_fn = osp.join(temp_dir, f'{name}.{suf}')
     command = re.sub(r'\{\}', tar_fn, command)
 
     with tarfile.open(tar_fn, tar_mode) as tar:
@@ -314,7 +317,7 @@ def pull(group, command, *, no_xz, name):
                 die(f'File {path} needs elevated permissions. Dying.')
 
     os.system(command)
-    os.remove(tar_fn)
+    rmtree(temp_dir, ignore_errors=True)
 
 
 @click.command('list')
