@@ -305,7 +305,6 @@ def pull(group, command, *, no_xz, name):
     file_paths = gather_effective_files(get_group_rps(group))
     temp_dir = tmp.mkdtemp()
     tar_fn = osp.join(temp_dir, f'{name}.{suf}')
-    command = re.sub(r'\{\}', tar_fn, command)
 
     with tarfile.open(tar_fn, tar_mode) as tar:
         for path in file_paths:
@@ -316,7 +315,10 @@ def pull(group, command, *, no_xz, name):
             except PermissionError:
                 die(f'File {path} needs elevated permissions. Dying.')
 
-    os.system(command)
+    for com in command:
+        com = re.sub(r'\{\}', tar_fn, com)
+        os.system(com)
+
     rmtree(temp_dir, ignore_errors=True)
 
 

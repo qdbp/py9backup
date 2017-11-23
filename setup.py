@@ -2,7 +2,7 @@ from setuptools import setup
 
 
 # semver with automatic minor bumps keyed to unix time
-__version__ = '1.0.1511396759'
+__version__ = '1.0.1511415987'
 
 
 setup(
