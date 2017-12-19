@@ -14,7 +14,8 @@ from datetime import date
 from pathlib import Path
 from shutil import copy as fcopy
 from shutil import rmtree
-from typing import List
+from typing import List, Dict, Set
+from typing import Iterable
 
 import click
 
@@ -101,13 +102,29 @@ def canonicalize_group_name(group):
     return group
 
 
+def get_backup_fp(fp):
+    return Path(fp.parent).joinpath('.' + fp.stem + '.bkp')
+
+
 def get_file_list_path(group, need=True):
     group = canonicalize_group_name(group)
-    fp = CONFIG_DIR.joinpath(f'{group}.txt')
 
-    if not fp.exists():
+    fp = CONFIG_DIR.joinpath(f'{group}.txt')
+    fp_bkp = get_backup_fp(fp)
+
+    if not fp.exists() or fp.stat().st_size == 0:
+        if fp_bkp.exists() and fp_bkp.stat().st_size > 0:
+            restore = click.confirm(
+                f'The group "{group}" was not found, but a backup file was. '
+                'Would you like to restore the backup file?',
+                default=True,
+            )
+            if restore:
+                fcopy(fp_bkp.as_posix(), fp.as_posix())
+                return fp
+
         if need:
-            die(f'Group "{group}" does not exist.')
+            die(f'Group "{group}" does not exist or is empty.')
         else:
             fp.touch()
 
@@ -131,8 +148,12 @@ def commit_group_rps(group, rps):
     Does NOT append or merge, that is the responsibility of the caller.
     '''
 
-    fp = get_file_list_path(group)
+    fp = get_file_list_path(group, need=False)
     tfd, tfn = tmp.mkstemp(text=True)
+
+    if fp.stat().st_size > 0:
+        fp_bkp = get_backup_fp(fp)
+        fcopy(fp.as_posix(), fp_bkp.as_posix())
 
     with open(tfd, 'w') as tf:
         for rp in sorted(set(rps)):
@@ -143,20 +164,20 @@ def commit_group_rps(group, rps):
     os.remove(tfn)
 
 
-def gather_effective_files(rps):
+def gather_effective_files(rps: Iterable[RichPath]):
     '''
     Converts a collection of include/exclude paths to a minimal collection
     of include-only paths.
 
-    Precedence is given to longer paths, irrespective of ordering.
+    Precedence is given to longer paths, irrespective of original ordering.
     '''
 
     # sort by depth
-    rps_by_depth = defaultdict(list)
+    rps_by_depth: Dict[int, List[RichPath]] = defaultdict(list)
     for rp in rps:
         rps_by_depth[rp.depth].append(rp)
 
-    fns_by_depth = defaultdict(set)
+    fns_by_depth: Dict[int, Set[str]] = defaultdict(set)
 
     # need to iterate in order of depth so that
     # + a/
@@ -194,7 +215,7 @@ def gather_effective_files(rps):
                 else:
                     fns_by_depth[cur_depth].add(cur_path)
 
-    out = set()
+    out: Set[str] = set()
     for fns in fns_by_depth.values():
         out |= fns
 
@@ -215,7 +236,7 @@ def gather_effective_files(rps):
     '--exclude', is_flag=True, default=False,
     help=(
         'Excludes the file or path. Overrides more general inclusions. '
-        'Overriden by more specific inclusions'
+        'Overriden by more specific inclusions.'
     )
 )
 def add_files(group, paths, *, exclude, allow_nx):
@@ -255,7 +276,7 @@ def show_files(group, *, full):
     rps = get_group_rps(group, need=True)
     if not full:
         for rp in rps:
-            print(rp)
+            print(' ' + str(rp))
     else:
         for fn in gather_effective_files(rps):
             print('\t' + fn)
@@ -271,6 +292,16 @@ def del_files(group, regex):
     Python's `re.match` is used, so the regexp should match from the
     beginning of the path. Use ^.* or similar.
     '''
+
+    if regex == '.':
+        answer = click.confirm(
+            '"del ." will delete every file in the group. Did you intend to '
+            'delete the current directory instead?',
+            default=True,
+        )
+        if answer:
+            regex = os.getcwd()
+
     path_reg = re.compile(regex)
     rps = get_group_rps(group)
 
@@ -288,12 +319,17 @@ def del_files(group, regex):
 @click.option('--name', default=None, help='name to use for the tarball')
 def pull(group, command, *, no_xz, name):
     '''
-    Pulls files into tarball, runs given command.
+    Pulls files into tarball, runs given commands on it.
 
-    Subsequently, runs a command on the tarball. "{}" in the command string is
-    expanded to be the name of the created tarball, a la find.
+    First, a tarball containing all of the files in the group is created
+    in a temporary directory. It is given a sensible default name, which
+    can be overriden with the --name option.
 
-    rsync, scp, git push, etc. are good candidate commands here.
+    This action accepts any number of positional parameters, each of which
+    is interpreted as a shell command to run. Within these commands, the
+    string "{}" is expanded to the name of the newly-created tar file.
+
+    After the commands have been executed, the tarfile is deleted.
     '''
 
     if name is None:
