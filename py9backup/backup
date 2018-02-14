@@ -11,11 +11,11 @@ import tarfile
 import tempfile as tmp
 from collections import defaultdict
 from datetime import date
+from glob import glob
 from pathlib import Path
 from shutil import copy as fcopy
 from shutil import rmtree
-from typing import List, Dict, Set
-from typing import Iterable
+from typing import Dict, Iterable, List, Set, Tuple
 
 import click
 from click import echo
@@ -23,13 +23,15 @@ from click import echo
 
 class RichPath:
     '''
-    A path with some metadata related to backup functionalty.
+    A path or collection of paths with some metadata related to backup
+    functionalty.
     '''
 
     _FLAGS_LEN = 5
     _FLAGS = [
         (0, 'x', 'exclude'),
         (1, '?', 'sticky'),
+        (2, 'g', 'is_glob'),
     ]
 
     @classmethod
@@ -45,10 +47,28 @@ class RichPath:
         return cls(path, **fdict)
 
     @property
-    def depth(self):
-        return str(self.path).rstrip('/').count('/') - 1
+    def path(self):
+        if self.is_glob:
+            raise ValueError('A glob-type RichPath has no single path')
+        else:
+            return self._paths[0]
 
-    def __init__(self, path_str, exclude=False, sticky=False):
+    @property
+    def paths_by_depth(self):
+        if self._paths_by_depth is None:
+
+            self._paths_by_depth: Dict[int, List[Tuple[bool, str]]] =\
+                defaultdict(list)
+
+            for path in self._paths:
+                self._paths_by_depth[
+                    str(path).rstrip('/').count('/') - 1
+                ].append((self.exclude, path))
+
+        return self._paths_by_depth
+
+    def __init__(self, path_str, *, exclude=False,
+                 sticky=False, is_filter=False, is_glob=False):
         '''
         Arguments:
             exclude:
@@ -56,16 +76,34 @@ class RichPath:
             sticky:
                 mark the file or path to persist in the database even if it
                 does not exist.
+            is_filter:
+                if True, this RichPath is treated as a regexp filter for other
+                members of the manifest instead of as a pathspec.
         '''
-        self.path = Path(path_str).absolute()
+
         self.exclude = exclude
         self.sticky = sticky
+        self.is_glob = is_glob
+
+        self._paths = None
+
+        if is_glob:
+            self._raw_path = str(Path(path_str).expanduser().absolute())
+            self._paths = glob(self._raw_path)
+        else:
+            self._paths = [str(Path(path_str).expanduser().absolute())]
+            self._raw_path = str(self._paths[0])
+
+        self._paths_by_depth = None
 
     def __eq__(self, other):
-        return self.path == other.path
+        return self._raw_path == other._raw_path
 
     def __lt__(self, other):
-        return self.path < other.path
+        if self.is_glob ^ other.is_glob:
+            return self.is_glob
+        else:
+            return self._raw_path < other._raw_path
 
     def __str__(self):
         base = [' '] * (self._FLAGS_LEN + 1)
@@ -73,13 +111,13 @@ class RichPath:
             if getattr(self, kwarg):
                 base[ix] = char
 
-        return ''.join(base) + str(self.path)
+        return ''.join(base) + str(self._raw_path)
 
     # include only the path in the hash, so that the same path with
     # different flags will intentionally collide in sets/dicts. This
     # makes overwriting the flags easy and enforces a uniqueness invariant.
     def __hash__(self):
-        return hash(self.path)
+        return hash(self._raw_path)
 
 
 def die(msg):
@@ -152,7 +190,7 @@ def commit_group_rps(group, rps):
     Does NOT append or merge, that is the responsibility of the caller.
     '''
 
-    fp = get_group_manifest_file(group, need=False)
+    fp = get_group_manifest_file(group, need=False, check_backup=False)
     tfd, tfn = tmp.mkstemp(text=True)
 
     if fp.stat().st_size > 0:
@@ -161,25 +199,28 @@ def commit_group_rps(group, rps):
 
     with open(tfd, 'w') as tf:
         for rp in sorted(set(rps)):
-            if rp.sticky or osp.exists(rp.path):
+            if rp.is_glob or rp.sticky or osp.exists(rp.path):
                 echo(rp, file=tf)
 
     fcopy(tfn, str(fp))
     os.remove(tfn)
 
 
-def gather_effective_files(rps: Iterable[RichPath]):
+def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
     '''
     Converts a collection of include/exclude paths to a minimal collection
     of include-only paths.
 
     Precedence is given to longer paths, irrespective of original ordering.
+
+    Path length is counted after globbing. Thus only globs can exclude globs.
     '''
 
-    # sort by depth
-    rps_by_depth: Dict[int, List[RichPath]] = defaultdict(list)
+    # sort paths by depth
+    all_paths_by_depth: Dict[int, List[Tuple[bool, str]]] = defaultdict(list)
     for rp in rps:
-        rps_by_depth[rp.depth].append(rp)
+        for depth, expaths in rp.paths_by_depth.items():
+            all_paths_by_depth[depth].extend(expaths)
 
     fns_by_depth: Dict[int, Set[str]] = defaultdict(set)
 
@@ -188,11 +229,10 @@ def gather_effective_files(rps: Iterable[RichPath]):
     # - a/1
     # + a/1/x
     # chains resolve correctly
-    for cur_depth, rps in sorted(rps_by_depth.items()):
-        for rp in rps:
-            cur_path = str(rp.path)
-            if rp.exclude:
-                # exclusions force explicit expansions of all levels above them
+    for cur_depth, ex_path in sorted(all_paths_by_depth.items()):
+        for exclude, cur_path in ex_path:
+            if exclude:
+                # exclusions force explicit expansion in each level above them
                 for dx in range(0, cur_depth):
                     prefix = None
                     for cand_prefix in fns_by_depth[dx]:
@@ -208,7 +248,7 @@ def gather_effective_files(rps: Iterable[RichPath]):
                         {str(x) for x in Path(prefix).iterdir()}
 
                 # exclude actual exclusion
-                fns_by_depth[cur_depth].remove(cur_path)
+                fns_by_depth[cur_depth].discard(cur_path)
 
             else:
                 # exclude redundant paths
@@ -243,7 +283,15 @@ def gather_effective_files(rps: Iterable[RichPath]):
         'Overriden by more specific inclusions.'
     )
 )
-def add_files(group, paths, *, exclude, allow_nx):
+@click.option(
+    '--glob/--no-glob', is_flag=True, default=None,
+    help=(
+        'If true, the path will be interpreted as a glob. If false, it will '
+        'be interpreted literally. If unset, the path will be treated as a '
+        'glob iff it contains "*".'
+    )
+)
+def add_files(group, paths, *, exclude, allow_nx, glob):
     '''
     Adds a path to be tracked under a group.
     '''
@@ -252,14 +300,18 @@ def add_files(group, paths, *, exclude, allow_nx):
 
     new_rps = set()
     for path in paths:
-        if not (allow_nx or osp.isfile(path) or osp.isdir(path)):
+
+        if glob is None:
+            glob = '*' in path
+
+        if not (allow_nx or osp.isfile(path) or osp.isdir(path) or glob):
             echo(
                 f'Path "{path}" does not exist. Ignoring. '
                 'Pass --allow-nx to force persistent inclusion.'
             )
             continue
 
-        new_rp = RichPath(path, exclude=exclude, sticky=allow_nx)
+        new_rp = RichPath(path, exclude=exclude, sticky=allow_nx, is_glob=glob)
         new_rps.add(new_rp)
 
     # order is important
@@ -309,7 +361,7 @@ def del_files(group, regex):
     path_reg = re.compile(regex)
     rps = get_group_rps(group)
 
-    keep_rps = [rp for rp in rps if not path_reg.search(str(rp.path))]
+    keep_rps = [rp for rp in rps if not path_reg.search(str(rp))]
 
     commit_group_rps(group, keep_rps)
 
@@ -365,7 +417,7 @@ def pull(group, command, *, no_xz, name):
 @click.command('list')
 def list_groups():
     '''
-    List known groups in the registry.
+    List known groups.
     '''
     for path in Path(CONFIG_DIR).glob('*.txt'):
         echo(path.stem)
