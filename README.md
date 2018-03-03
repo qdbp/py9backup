@@ -18,10 +18,26 @@ The future of backup is here. Yesterday.
 
 `backup pull stuff 'gdrive upload {}'`
 
-
 `backup add secret ~/secret_stuff`
 
 `backup pull secret 'gpg -c {} && gdrive upload {}.gpg'`
+
+
+### glob support
+
+Recursive globs are supported with the same syntax as Python's `glob` function:
+
+ * yes: `foo/**/bar.txt`
+ * yes: `foo/**/*.txt`
+ * no: ~~`foo/**.txt`~~ will not recurse
+ 
+Example commands:
+
+`backup add stuff ./random/**/important/`
+
+`backup add stuff ./random/**/*.txt`
+
+`backup add ./random/**/*.bkp -- exclude`
 
 ### deletion
 `backup add stuff ~/garbage1`
@@ -37,3 +53,59 @@ The future of backup is here. Yesterday.
 
 ### delete a whole group
 `backup forget stuff`
+
+## how it works
+
+Each time you add files to a group, a plaintext *manifest file* `<group
+name>.txt` is created in the config directory at `$HOME/.config/py9backup`
+
+Entires are stored as you enter them. Each time you `pull` the files, the
+entires are read and mached to files existing at that point in time.
+
+## precedence semantics
+
+Some files can be matched by more than one entry in the manifest. The
+detailed resolution rules are given below. The two rules of thumb are:
+
+- **files beat directories**
+- **specific beats general**
+
+These rules were designed to be intuitive. However, for greater certainty they
+explained in detail below.
+
+### precedence examples
+
+For example, if for a new group `mygroup` one runs the following commands:
+
+```
+1) backup add mygroup /stuff/
+2) backup add mygroup /stuff/old/ --exclude
+3) backup add mygroup /stuff/old/important/
+4) backup add mygroup /stuff/**/*.bkp --exclude
+5) backup add mygroup /stuff/archive/**/*.bkp
+6) backup add mygroup /stuff/old/important/special.bkp
+7) backup add mygroup /stuff/**/interesting/
+```
+
+The behaviour for some example hypothetical files will be as follows:
+
+ * include `/stuff/new/some.file`  (entry 1)
+ * exclude ~~`/stuff/old/some.file`~~ (entry 2)
+ * include `/stuff/old/important/some.file` (entry 3 ~~entry 2~~)
+ * exclude ~~`/stuff/old/important/some.bkp`~~ (entry 4 ~~entry 3~~)
+ * include `/stuff/archive/2018/store.bkp` (entry 5 ~~entry 4~~)
+ * include `/stuff/old/important/special.bkp` (entry 6 ~~entry 4~~)
+ * exclude ~~`/stuff/old/a/b/c/interesting/some.bkp`~~ (entry 4 ~~entry 7~~)
+ * include `/stuff/old/a/b/c/interesting/some.file` (entry 7 ~~entry 2~~)
+
+For globs, specificity is determined by the number of non-glob segments:
+
+```
+1) backup add edgy /**/huh/ --exclude
+2) backup add edgy /**/huh/huh/
+```
+
+Will give:
+ * include `/huh/huh/foo.txt` (entry 2 ~~entry 1~~)
+ 
+```
