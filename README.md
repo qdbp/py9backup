@@ -64,14 +64,11 @@ entires are read and mached to files existing at that point in time.
 
 ## precedence semantics
 
-Some files can be matched by more than one entry in the manifest. The
-detailed resolution rules are given below. The two rules of thumb are:
+Some files can be matched by more than one entry in the manifest. The two rules
+of thumb are:
 
 - **files beat directories**
 - **specific beats general**
-
-These rules were designed to be intuitive. However, for greater certainty they
-explained in detail below.
 
 ### precedence examples
 
