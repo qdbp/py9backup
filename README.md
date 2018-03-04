@@ -37,7 +37,7 @@ Example commands:
 
 `backup add stuff ./random/**/*.txt`
 
-`backup add ./random/**/*.bkp -- exclude`
+`backup add stuff ./random/**/*.bkp -- exclude`
 
 ### deletion
 `backup add stuff ~/garbage1`

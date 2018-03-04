@@ -16,8 +16,7 @@ from glob import iglob
 from heapq import merge
 from itertools import groupby
 from pathlib import Path
-from shutil import copy as fcopy
-from shutil import rmtree
+from shutil import copy as fcopy, rmtree
 from traceback import format_stack
 from typing import Dict, Generator, Iterable, List, Set, Tuple
 
@@ -328,9 +327,9 @@ def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
 @click.option(
     '--glob/--no-glob', is_flag=True, default=None,
     help=(
-            'If true, the path will be interpreted as a glob. If false, it will '
-            'be interpreted literally. If unset, the path will be treated as a '
-            'glob iff it contains "*".'
+            'If true, the path will be interpreted as a glob. If false, it '
+            'will be interpreted literally. If unset, the path will be '
+            'treated as a glob iff it contains an unescaped "*".'
     )
 )
 def add_files(group, paths, *, exclude, allow_nx, glob):
@@ -450,7 +449,7 @@ def pull(group, command, *, no_xz, name):
                 die(f'File {path} needs elevated permissions. Dying.')
 
     for com in command:
-        com = re.sub(r'\{\}', tar_fn, com)
+        com = re.sub(r'{}', tar_fn, com)
         os.system(com)
 
     rmtree(temp_dir, ignore_errors=True)
@@ -461,7 +460,7 @@ def list_groups():
     """
     List known groups.
     """
-    for path in Path(CONFIG_DIR).glob('*.txt'):
+    for path in sorted(Path(CONFIG_DIR).glob('*.txt')):
         echo(path.stem)
 
 
