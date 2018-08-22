@@ -9,6 +9,7 @@ import string
 import sys
 import tarfile
 import tempfile as tmp
+import configparser as ini
 from collections import defaultdict
 from datetime import date
 from functools import lru_cache
@@ -41,6 +42,16 @@ def soft_assert(expr, msg):
 
 ALLOWABLE_CHARS = set(string.ascii_letters) | set(string.digits) | {'_'}
 CONFIG_DIR = Path('~/.config/py9backup/').expanduser()
+
+
+def load_settings():
+    settings_fn = CONFIG_DIR.joinpath('settings.ini')
+    settings_fn.touch()
+    
+    parser = ini.ConfigParser()
+    parser.read(str(settings_fn))
+
+    return parser
 
 
 @lru_cache(maxsize=1 << 10)
@@ -409,12 +420,12 @@ def del_files(group, regex):
 
 @click.command()
 @click.argument('group')
-@click.argument('command', nargs=-1)
+@click.argument('commands', nargs=-1)
 @click.option(
     '--no-xz', default=False, is_flag=True, help='turn off xz compression',
 )
 @click.option('--name', default=None, help='name to use for the tarball')
-def pull(group, command, *, no_xz, name):
+def pull(group, commands, *, no_xz, name):
     """
     Pulls files into tarball, runs given commands on it.
 
@@ -448,7 +459,17 @@ def pull(group, command, *, no_xz, name):
             except PermissionError:
                 die(f'File {path} needs elevated permissions. Dying.')
 
-    for com in command:
+    if not commands:
+        settings = load_settings()
+        try:
+            commands = [settings['py9backup']['default_pull_command']]
+            click.echo(
+                'Running default pull commands:\n\t' + '\n\t'.join(commands)
+            )
+        except KeyError:
+            commands = []
+
+    for com in commands:
         com = re.sub(r'{}', tar_fn, com)
         os.system(com)
 
