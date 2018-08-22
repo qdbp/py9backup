@@ -103,7 +103,6 @@ class RichPath:
 
     def sorted_iter_prio_path(self) -> \
             Generator[Tuple[int, int, str], None, None]:
-
         """
         Generates the paths of this RP according to their priority.
 
@@ -295,7 +294,8 @@ def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
             # exclude redundant paths
             # this only works because of depth sorting in outer loop!
             for dx in range(root_depth, cur_depth):
-                if any([cur_path.startswith(p) for p in included_by_depth[dx]]):
+                if any([cur_path.startswith(p)
+                        for p in included_by_depth[dx]]):
                     break
             else:
                 included_by_depth[cur_depth].add(cur_path)
@@ -313,23 +313,23 @@ def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
 @click.option(
     '--allow-nx', is_flag=True, default=False,
     help=(
-            'Allows nonexistent entries and persists them until explicit '
-            'deletion. Otherwise, nonexistent entries are dropped.'
+        'Allows nonexistent entries and persists them until explicit '
+        'deletion. Otherwise, nonexistent entries are dropped.'
     )
 )
 @click.option(
     '--exclude', is_flag=True, default=False,
     help=(
-            'Excludes the file or path. Overrides more general inclusions. '
-            'Overriden by more specific inclusions.'
+        'Excludes the file or path. Overrides more general inclusions. '
+        'Overriden by more specific inclusions.'
     )
 )
 @click.option(
     '--glob/--no-glob', is_flag=True, default=None,
     help=(
-            'If true, the path will be interpreted as a glob. If false, it '
-            'will be interpreted literally. If unset, the path will be '
-            'treated as a glob iff it contains an unescaped "*".'
+        'If true, the path will be interpreted as a glob. If false, it '
+        'will be interpreted literally. If unset, the path will be '
+        'treated as a glob iff it contains an unescaped "*".'
     )
 )
 def add_files(group, paths, *, exclude, allow_nx, glob):
@@ -518,6 +518,6 @@ if __name__ == '__main__':
         die(
             "The program has encountered an invalid state. "
             "Please report the following trace as an issue at "
-            "https://github.com/qdbp/py9backup\nMessage:\n" +
+            "https://github.com/qdbp/py9backup\nTrace:\n" +
             '\n' + format_exc()
         )
