@@ -216,7 +216,8 @@ def get_group_manifest_file(
     fp_bkp = get_backup_fp(fp)
 
     # conditions not met
-    if (need_exist and not fp.exists()):
+    if not fp.exists():
+        print('foooooooxxx', fp_bkp.exists())
         if check_backup and fp_bkp.exists():
             msg = f'The group "{group}" was not found, but a backup file '\
                 + 'was. Would you like to restore the backup file?'
@@ -256,9 +257,10 @@ def commit_group_rps(group: str, rps: Iterable[RichPath]) -> None:
 
     fp = get_group_manifest_file(group, need_exist=False, check_backup=False)
     tfd, tfn = tmp.mkstemp(text=True)
+    fp_bkp = get_backup_fp(fp)
 
+    # if the file already exists, back it up
     if fp.exists() and fp.stat().st_size > 0:
-        fp_bkp = get_backup_fp(fp)
         fcopy(str(fp), str(fp_bkp))
 
     with tmp.NamedTemporaryFile(mode='w') as tf:
@@ -268,6 +270,10 @@ def commit_group_rps(group: str, rps: Iterable[RichPath]) -> None:
 
         tf.flush()
         fcopy(tf.name, str(fp))
+
+    # if a backup does not exist, initialize it to the fresh file contents
+    if not fp_bkp.exists() and fp.stat().st_size > 0:
+        fcopy(str(fp), str(fp_bkp))
 
 
 def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
@@ -532,29 +538,70 @@ def list_groups():
 
 @main.command()
 @click.argument('group')
-def forget(group):
+@click.option('--drop-backup', default=False, help='also forgets the backup')
+def forget(group, drop_backup):
     """
     Deletes the registry file for a group. Unless that file itself is
     backed up (as is recommended), this cannot be undone.
     """
 
+    def render_lines(lines):
+        if len(lines) < 3:
+            out = '\n'.join(lines)
+        else:
+            out = '\n'.join([lines[0], '...', lines[-1]])
+        return '\n' + out + '\n'
+
     group_path = get_group_manifest_file(group, need_exist=True)
+    backup_file = get_backup_fp(group_path)
 
-    if not group_path.exists():
-        return
+    prompted = False
+    for file_in_question in\
+            [group_path] + ([backup_file] if drop_backup else []):
 
-    with group_path.open('r') as f:
-        lines = f.readlines()
+        if not file_in_question.exists():
+            continue
 
-    if lines:
-        message =\
-            f'Confirm deletion of group {group} containing {len(lines)} lines'\
-            + '\n\t' + lines[0] + '\t...\n\t' + lines[-1] + '\n'
+        with file_in_question.open('r') as f:
+            lines = f.readlines()
 
-        if not click.confirm(message, default=False):
-            return
+        backup_str =\
+            '(backup file)' if file_in_question == backup_file else ''
+        if not prompted:
+            if lines and not click.confirm(
+                f'Confirm deletion of group {group} {backup_str} containing '
+                + f'{len(lines)} lines' + render_lines(lines),
+                    default=False):
+                return
+            prompted = True
 
-    group_path.unlink()
+        file_in_question.unlink()
+
+
+@main.command()
+@click.argument('group', type=str)
+@click.argument('newname', type=str)
+@click.pass_context
+def rename(ctx, group, newname):
+
+    group = canonicalize_group_name(group)
+    fp = get_group_manifest_file(group, need_exist=False)
+
+    if not fp.exists():
+        die('Group "{group}" does not exist')
+
+    newname = canonicalize_group_name(newname)
+    new_fp = get_group_manifest_file(newname, need_exist=False)
+
+    if not new_fp.exists() or click.confirm(
+        f'Group name "{newname}" already exists. Overwrite? Warning: '
+            f'overwrite will also destroy backup for "{newname}"',
+            default=False):
+
+        ctx.invoke(forget, group=newname, drop_backup=True)
+
+        get_backup_fp(fp).rename(get_backup_fp(new_fp))
+        fp.rename(new_fp)
 
 
 if __name__ == '__main__':

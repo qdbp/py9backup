@@ -55,6 +55,7 @@ def run(*args, asrt=0, noex=True, **kwargs):
     if len(args) == 1:
         args = args[0].split(' ')
 
+    print('+' + ' '.join(args))
     out = RUNNER.invoke(bkp.main, args, **kwargs)  # type: ignore
 
     if out.exception:
@@ -129,7 +130,7 @@ def test_basic_functionality():
 
         # should restore backup
         out = run('show', 'test', input='Y').output
-        comp_out = '\n'.join(out.split('\n')[1:])
+        comp_out = '\n'.join(out.split('\n')[2:])
         assert comp_out == out_after_exclude
 
         # test forget
@@ -220,3 +221,24 @@ def test_empty_handling():
                 assert f.readlines() == ['pulled_y']
 
         run('forget mygroup')
+
+
+def test_rename():
+    with clean_configdir():
+        run('add mygroup ./stuff')
+        run('forget mygroup', input='y')
+
+        run('add other ./xxx --allow-nx')
+
+        # should fail since mygroup should have a backup which needs prompt
+        run('rename other mygroup', input='')
+
+        # restore backup with this line
+        assert 'stuff' in run('show', 'mygroup', input='y').output
+        assert 'xxx' not in run('show', 'mygroup').output
+
+        # single confirm should overwrite both restored main file and backup
+        run('rename other mygroup', input='y')
+
+        assert 'stuff' not in run('show', 'mygroup').output
+        assert 'xxx' in run('show', 'mygroup').output
