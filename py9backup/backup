@@ -25,9 +25,12 @@ import click
 from click import echo
 
 
+DIE_CODE = -1
+
+
 def die(msg):
     echo(msg, file=sys.stderr)
-    sys.exit(-1)
+    sys.exit(DIE_CODE)
 
 
 def soft_assert(expr, msg):
@@ -35,8 +38,8 @@ def soft_assert(expr, msg):
         die(
             "The program has encountered an invalid state. "
             "Please report the following trace as an issue at "
-            "https://github.com/qdbp/py9backup\nMessage:\n" +
-            msg + '\n' + format_stack()
+            "https://github.com/qdbp/py9backup\nMessage:\n"
+            + msg + '\n' + format_stack()
         )
 
 
@@ -47,7 +50,7 @@ CONFIG_DIR = Path('~/.config/py9backup/').expanduser()
 def load_settings():
     settings_fn = CONFIG_DIR.joinpath('settings.ini')
     settings_fn.touch()
-    
+
     parser = ini.ConfigParser()
     parser.read(str(settings_fn))
 
@@ -113,16 +116,16 @@ class RichPath:
             return self.raw_entry
 
     def sorted_iter_prio_path(self) -> \
-            Generator[Tuple[int, int, str], None, None]:
+            Generator[Tuple[int, str, int, bool], None, None]:
         """
         Generates the paths of this RP according to their priority.
 
         Yields:
-            Tuples of the form (path_depth, glob_prio, is_include, path)
+            Tuples of the form (path_depth, path, glob_prio, is_include)
             suitable for inclusion in order.
         """
 
-        iincl = 1 - int(self.exclude)
+        iincl = not self.exclude
         gop = self.raw_entry
 
         # if the segment is not a glob, treat it like a regular path
@@ -192,42 +195,54 @@ def get_backup_fp(fp: Path) -> Path:
     return Path(fp.parent).joinpath('.' + fp.stem + '.bkp')
 
 
-def get_group_manifest_file(group: str, need=True, check_backup=True) -> Path:
+def get_group_manifest_file(
+        group: str,
+        need_exist=True,
+        check_backup=True
+) -> Path:
     """
     Get the path of the file storing the backup manifest for the group.
+
+    Arguments:
+        group: group for which to get manifest file
+        need_exist: if True, dies if manifest does not exist.
+        check_backup: if we would die because of need_*s, check backup first.
+            If a backup file exists, prompt to restore.
     """
+
     group = canonicalize_group_name(group)
 
     fp = CONFIG_DIR.joinpath(f'{group}.txt')
     fp_bkp = get_backup_fp(fp)
 
-    if not fp.exists() or fp.stat().st_size == 0:
-        if fp_bkp.exists() and fp_bkp.stat().st_size > 0 and check_backup:
-            restore = click.confirm(
-                f'The group "{group}" was not found, but a backup file was. '
-                'Would you like to restore the backup file?',
-                default=True,
-            )
-            if restore:
+    # conditions not met
+    if (need_exist and not fp.exists()):
+        if check_backup and fp_bkp.exists():
+            msg = f'The group "{group}" was not found, but a backup file '\
+                + 'was. Would you like to restore the backup file?'
+
+            if click.confirm(msg, default=True):
                 fcopy(fp_bkp.as_posix(), fp.as_posix())
                 return fp
 
-        if need:
-            die(f'Group "{group}" does not exist or is empty.')
-        else:
-            fp.touch()
+        elif need_exist:
+            die(f'Group "{group}" does not exist.')
 
     return fp
 
 
-def get_group_rps(group: str, need=False) -> List[RichPath]:
-    fp = get_group_manifest_file(group, need=need)
-    rps = []
-    with fp.open('r') as f:
-        for line in f:
-            rps.append(RichPath.parse(line))
+def get_group_rps(
+        group: str,
+        need_exist=False,
+) -> List[RichPath]:
 
-    return rps
+    fp = get_group_manifest_file(group, need_exist=need_exist)
+
+    if not fp.exists():
+        return []
+    else:
+        with fp.open('r') as f:
+            return [RichPath.parse(line) for line in f]
 
 
 def commit_group_rps(group: str, rps: Iterable[RichPath]) -> None:
@@ -235,22 +250,24 @@ def commit_group_rps(group: str, rps: Iterable[RichPath]) -> None:
     Atomically commit the passed rps as the new contents of the group file.
 
     Does NOT append or merge, that is the responsibility of the caller.
+
+    Does not write empty files - empty rps is a noop.
     """
 
-    fp = get_group_manifest_file(group, need=False, check_backup=False)
+    fp = get_group_manifest_file(group, need_exist=False, check_backup=False)
     tfd, tfn = tmp.mkstemp(text=True)
 
-    if fp.stat().st_size > 0:
+    if fp.exists() and fp.stat().st_size > 0:
         fp_bkp = get_backup_fp(fp)
-        fcopy(fp.as_posix(), fp_bkp.as_posix())
+        fcopy(str(fp), str(fp_bkp))
 
-    with open(tfd, 'w') as tf:
+    with tmp.NamedTemporaryFile(mode='w') as tf:
         for rp in sorted(set(rps)):
             if rp.is_glob or rp.sticky or osp.exists(rp.path):
-                echo(rp, file=tf)
+                tf.write(str(rp) + '\n')
 
-    fcopy(tfn, str(fp))
-    os.remove(tfn)
+        tf.flush()
+        fcopy(tf.name, str(fp))
 
 
 def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
@@ -318,7 +335,22 @@ def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
     return sorted(out)
 
 
-@click.command(name='add')
+# # # COMMANDS SECTION
+
+
+@click.group()
+def main():
+    """
+    Tracks files to be backed up, on a per-group basis.
+
+    The first argument is always the group name, which can be an arbitrary well
+    behaving string which serves as an identifier for the collection of paths
+    added. This allows different backup flow for different files.
+    """
+    pass
+
+
+@main.command(name='add')
 @click.argument('group', nargs=1)
 @click.argument('paths', nargs=-1)
 @click.option(
@@ -366,12 +398,12 @@ def add_files(group, paths, *, exclude, allow_nx, glob):
         new_rp = RichPath(path, exclude=exclude, sticky=allow_nx, is_glob=glob)
         new_rps.add(new_rp)
 
-    # order is important
+    # order is important, we need to favour the new rps in hash conflicts
     rps = new_rps | rps
     commit_group_rps(group, rps)
 
 
-@click.command('show')
+@main.command('show')
 @click.argument('group')
 @click.option(
     '--full', is_flag=True, default=False,
@@ -381,7 +413,7 @@ def show_files(group, *, full):
     """
     Shows all tracked paths for group.
     """
-    rps = get_group_rps(group, need=True)
+    rps = get_group_rps(group, need_exist=True)
     if not full:
         for rp in rps:
             echo(' ' + str(rp))
@@ -390,7 +422,7 @@ def show_files(group, *, full):
             echo('\t' + fn)
 
 
-@click.command(name='del')
+@main.command(name='del')
 @click.argument('group')
 @click.argument('regex')
 def del_files(group, regex):
@@ -401,31 +433,39 @@ def del_files(group, regex):
     beginning of the path. Use ^.* or similar.
     """
 
-    if regex == '.':
-        answer = click.confirm(
+    if regex == '.' and click.confirm(
             '"del ." will delete every file in the group. Did you intend to '
             'delete the current directory instead?',
-            default=True,
-        )
-        if answer:
-            regex = os.getcwd()
+                default=True):
+        regex = os.getcwd()
+    elif regex == '..' and click.confirm(
+        '"del .." will likely delete every file in the group. Did you'
+        'intend to delete the current directory instead?',
+            default=True):
+        regex = str(Path(os.getcwd()).parent)
+
+    regex.rstrip('/')
+
+    print(regex)
 
     path_reg = re.compile(regex)
     rps = get_group_rps(group)
 
     keep_rps = [rp for rp in rps if not path_reg.search(str(rp))]
 
+    print(keep_rps)
+
     commit_group_rps(group, keep_rps)
 
 
-@click.command()
+@main.command()
 @click.argument('group')
 @click.argument('commands', nargs=-1)
 @click.option(
     '--no-xz', default=False, is_flag=True, help='turn off xz compression',
 )
 @click.option('--name', default=None, help='name to use for the tarball')
-def pull(group, commands, *, no_xz, name):
+def pull(group, commands, *, no_xz, name) -> None:
     """
     Pulls files into tarball, runs given commands on it.
 
@@ -446,7 +486,12 @@ def pull(group, commands, *, no_xz, name):
     tar_mode = 'w' if no_xz else 'w:xz'
     suf = 'tar' if no_xz else 'tar.xz'
 
-    file_paths = gather_effective_files(get_group_rps(group))
+    file_paths = gather_effective_files(get_group_rps(group, need_exist=True))
+
+    if len(file_paths) == 0 and not click.confirm(
+            f'Group {group} is empty. Continue?', default=False):
+        return
+
     temp_dir = tmp.mkdtemp()
     tar_fn = osp.join(temp_dir, f'{name}.{suf}')
 
@@ -476,7 +521,7 @@ def pull(group, commands, *, no_xz, name):
     rmtree(temp_dir, ignore_errors=True)
 
 
-@click.command('list')
+@main.command('list')
 def list_groups():
     """
     List known groups.
@@ -485,44 +530,32 @@ def list_groups():
         echo(path.stem)
 
 
-@click.command()
+@main.command()
 @click.argument('group')
 def forget(group):
     """
     Deletes the registry file for a group. Unless that file itself is
     backed up (as is recommended), this cannot be undone.
     """
-    group_path = get_group_manifest_file(group, need=True)
+
+    group_path = get_group_manifest_file(group, need_exist=True)
+
+    if not group_path.exists():
+        return
 
     with group_path.open('r') as f:
         lines = f.readlines()
 
-    message = \
-        f'Confirm deletion of group {group} containing {len(lines)} lines' + \
-        '\n\t' + lines[0] + '\t...\n\t' + lines[-1] + '\n'
+    if lines:
+        message =\
+            f'Confirm deletion of group {group} containing {len(lines)} lines'\
+            + '\n\t' + lines[0] + '\t...\n\t' + lines[-1] + '\n'
 
-    if click.confirm(message):
-        group_path.unlink()
+        if not click.confirm(message, default=False):
+            return
 
+    group_path.unlink()
 
-@click.group()
-def main():
-    """
-    Tracks files to be backed up, on a per-group basis.
-
-    The first argument is always the group name, which can be an arbitrary well
-    behaving string which serves as an identifier for the collection of paths
-    added. This allows different backup flow for different files.
-    """
-    pass
-
-
-main.add_command(add_files)
-main.add_command(del_files)
-main.add_command(forget)
-main.add_command(list_groups)
-main.add_command(show_files)
-main.add_command(pull)
 
 if __name__ == '__main__':
 
@@ -537,8 +570,9 @@ if __name__ == '__main__':
         from traceback import format_exc
 
         die(
-            "The program has encountered an invalid state. "
+            "The program has encountered an invalid state.\n"
             "Please report the following trace as an issue at "
-            "https://github.com/qdbp/py9backup\nTrace:\n" +
-            '\n' + format_exc()
+            "https://github.com/qdbp/py9backup:\n"
+            + '\n' + format_exc()
+            + "\nI apologize for the inconvenience."
         )

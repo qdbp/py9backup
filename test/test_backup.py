@@ -51,8 +51,10 @@ class clean_configdir:
 
 
 def run(*args, asrt=0, noex=True, **kwargs):
+
     if len(args) == 1:
         args = args[0].split(' ')
+
     out = RUNNER.invoke(bkp.main, args, **kwargs)  # type: ignore
 
     if out.exception:
@@ -184,7 +186,7 @@ def test_globs():
         run('add', 'test', './testdir/**/*.png')
         out = out_png = run('show', 'test').output
 
-        assert re.compile(' +g +[^ ]+\*\*\/\*.png').search(out_png)
+        assert re.compile(r' +g +[^ ]+\*\*\/\*.png').search(out_png)
 
         out_full_png = run('show', 'test', '--full').output
 
@@ -200,3 +202,21 @@ def test_globs():
         out_full_png = run('show', 'test', '--full').output
 
         print(out_full_png)
+
+
+def test_empty_handling():
+
+    with clean_configdir():
+        run('add mygroup ./stuff')
+        run('del mygroup .*/stuff')
+
+        with tempshellfns() as (ofn, _):
+            for inp in ['', 'y', 'n']:
+                run(
+                    'pull', 'mygroup', f'echo -n pulled_{inp} > {ofn}',
+                    input=inp)
+
+            with open(ofn) as f:
+                assert f.readlines() == ['pulled_y']
+
+        run('forget mygroup')
