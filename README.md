@@ -8,6 +8,12 @@ It runs a command of your choosing on it.
 
 The future of backup is here. Yesterday.
 
+## philosophy
+
+- **user-comprehensible code**: straightforwardness > simplicity
+- **user-editable data**: straightforwardness > efficiency
+- **YAGNI**: incremental growth > top-down design
+
 ## usage
 
 ### basic workflow
