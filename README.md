@@ -54,6 +54,9 @@ Example commands:
 ### delete a whole group
 `backup forget stuff`
 
+### rename a group
+`backup rename stuff newstuff`
+
 ## how it works
 
 Each time you add files to a group, a plaintext *manifest file* `<group
