@@ -696,7 +696,7 @@ def forget(group: str, drop_backup: bool):
 
 @main.command()
 @click.argument("group", type=str)
-@click.argument("newname", type=str)
+@click.argument("new_name", type=str)
 @click.pass_context
 def rename(ctx, group: str, new_name: str):
 

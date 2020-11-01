@@ -1,26 +1,23 @@
 import os
 import os.path as osp
 import re
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from shutil import rmtree
 from tempfile import mkdtemp, mkstemp
 
-from click.testing import CliRunner
+from click.testing import CliRunner, Result
+
+from py9backup import backup
 
 TEST_DIR = osp.dirname(osp.realpath(__file__))
 
-# load the script as a module
-bkp = SourceFileLoader(
-    "backup", Path(TEST_DIR).parent.joinpath("py9backup/backup").as_posix()
-).load_module()
-
-# patch the backup directory
+# patch the backup.py directory
 RUNNER = CliRunner()
 
 os.chdir(TEST_DIR)
 
 
+# noinspection PyMissingTypeHints
 class tempshellfns:
     def __enter__(self):
         self.shellout_fd, self.shellout_fn = mkstemp()
@@ -35,25 +32,26 @@ class tempshellfns:
         os.remove(self.shellout_fn)
 
 
+# noinspection PyMissingTypeHints
 class clean_configdir:
     def __enter__(self):
         self.dir = mkdtemp()
-        self.old_dir_path = bkp.CONFIG_DIR  # type: ignore
-        bkp.CONFIG_DIR = Path(self.dir)  # type: ignore
+        self.old_dir_path = backup.CONFIG_DIR
+        backup.CONFIG_DIR = Path(self.dir)
         return self.dir
 
     def __exit__(self, *args):
-        bkp.CONFIG_DIR = self.old_dir_path  # type: ignore
+        backup.CONFIG_DIR = self.old_dir_path
         rmtree(self.dir)
 
 
-def run(*args, asrt=0, noex=True, **kwargs):
+def run(*args, asrt=0, noex=True, **kwargs) -> Result:
 
     if len(args) == 1:
         args = args[0].split(" ")
 
     print("+" + " ".join(args))
-    out = RUNNER.invoke(bkp.main, args, **kwargs)  # type: ignore
+    out: Result = RUNNER.invoke(backup.main, args, **kwargs)
 
     if out.exception:
         print(out.exception)
@@ -67,36 +65,39 @@ def run(*args, asrt=0, noex=True, **kwargs):
     return out
 
 
-def test_is_segment_glob():
-    assert bkp.is_segment_glob("/**")
-    assert bkp.is_segment_glob("/foo/*")
-    assert bkp.is_segment_glob("/foo/*.bkp")
-    assert bkp.is_segment_glob("/foo/**")
-    assert bkp.is_segment_glob("/foo/**/*.bkp")
-    assert bkp.is_segment_glob("/foo/**/")
-    assert bkp.is_segment_glob(r"/foo/\**/")
-    assert not bkp.is_segment_glob(r"/foo/\*.bkp")
-    assert not bkp.is_segment_glob("/foo/bar/")
+def test_is_glob() -> None:
+    assert backup.is_glob("/**")
+    assert backup.is_glob("/foo/*")
+    assert backup.is_glob("/foo/*.bkp")
+    assert backup.is_glob("/foo/**")
+    assert backup.is_glob("/foo/**/*.bkp")
+    assert backup.is_glob("/foo/**/")
+    assert backup.is_glob(r"/foo/\**/")
+    assert not backup.is_glob(r"/foo/\*.bkp")
+    assert not backup.is_glob("/foo/bar/")
 
-    assert bkp.is_segment_glob("*.bkp")
-    assert bkp.is_segment_glob("*")
-    assert bkp.is_segment_glob("**")
-    assert not bkp.is_segment_glob(r"\*")
-    assert bkp.is_segment_glob(r"\**")
-    assert bkp.is_segment_glob(r"*\*")
-
-
-def test_gop_prio():
-    assert bkp.gop_prio("/") == 0
-    assert bkp.gop_prio("/**/") == 0
-    assert bkp.gop_prio("/foo") == 1
-    assert bkp.gop_prio("/foo/") == 1
-    assert bkp.gop_prio("/foo/**/bar/**/*.bkp") == 2
-    assert bkp.gop_prio("/foo/bar/") == 2
-    assert bkp.gop_prio("/foo/bar/baz.png") == 3
+    assert backup.is_glob("*.bkp")
+    assert backup.is_glob("*")
+    assert backup.is_glob("**")
+    assert not backup.is_glob(r"\*")
+    assert backup.is_glob(r"\**")
+    assert backup.is_glob(r"*\*")
 
 
-def test_basic_functionality():
+def test_gop_prio() -> None:
+    for path, target_prio in {
+        "/": 0,
+        "/**/": 0,
+        "/foo": 1,
+        "/foo/": 1,
+        "/foo/**/bar/**/*.bkp": 2,
+        "/foo/bar/": 2,
+        "/foo/bar/baz.png": 3,
+    }.items():
+        assert backup.calc_raw_path_priority(path) == target_prio
+
+
+def test_basic_functionality() -> None:
     with clean_configdir() as mock_dir:
         run("add", "test", "./testdir/")
         out = out_add_first = run("show", "test").output
@@ -125,9 +126,9 @@ def test_basic_functionality():
         # test accidental delete
         os.remove(osp.join(mock_dir, "test.txt"))
 
-        # should restore backup
+        # should restore backup.py
         out = run("show", "test", input="Y").output
-        comp_out = "\n".join(out.split("\n")[2:])
+        comp_out = "\n".join(out.split("\n")[1:])
         assert comp_out == out_after_exclude
 
         # test forget
@@ -139,7 +140,7 @@ def test_basic_functionality():
         assert "test" in run("list").output
 
 
-def test_prio_example():
+def test_prio_example() -> None:
     with clean_configdir():
         run("add edgy ./weird/**/wat/ --exclude")
         run("add edgy ./weird/**/wat/wat/")
@@ -154,7 +155,7 @@ def test_prio_example():
         assert "weird/wat/wat/some.file" in shell_out
 
 
-def test_readme_example():
+def test_readme_example() -> None:
     with clean_configdir():
         run("add mygroup ./stuff/")
         run("add mygroup ./stuff/old/ --exclude")
@@ -179,7 +180,7 @@ def test_readme_example():
         assert "/stuff/old/a/b/c/interesting/some.file" in shell_out
 
 
-def test_globs():
+def test_globs() -> None:
     with clean_configdir() as mock_dir:
         run("add", "test", "./testdir/**/*.png")
         out = out_png = run("show", "test").output
@@ -202,7 +203,7 @@ def test_globs():
         print(out_full_png)
 
 
-def test_empty_handling():
+def test_empty_handling() -> None:
 
     with clean_configdir():
         run("add mygroup ./stuff")
@@ -210,7 +211,12 @@ def test_empty_handling():
 
         with tempshellfns() as (ofn, _):
             for inp in ["", "y", "n"]:
-                run("pull", "mygroup", f"echo -n pulled_{inp} > {ofn}", input=inp)
+                run(
+                    "pull",
+                    "mygroup",
+                    f"echo -n pulled_{inp} > {ofn}",
+                    input=inp,
+                )
 
             with open(ofn) as f:
                 assert f.readlines() == ["pulled_y"]
@@ -218,21 +224,21 @@ def test_empty_handling():
         run("forget mygroup")
 
 
-def test_rename():
+def test_rename() -> None:
     with clean_configdir():
         run("add mygroup ./stuff")
         run("forget mygroup", input="y")
 
         run("add other ./xxx --allow-nx")
 
-        # should fail since mygroup should have a backup which needs prompt
+        # should fail since mygroup should have a backup.py which needs prompt
         run("rename other mygroup", input="")
 
-        # restore backup with this line
+        # restore backup.py with this line
         assert "stuff" in run("show", "mygroup", input="y").output
         assert "xxx" not in run("show", "mygroup").output
 
-        # single confirm should overwrite both restored main file and backup
+        # single confirm should overwrite both restored main file and backup.py
         run("rename other mygroup", input="y")
 
         assert "stuff" not in run("show", "mygroup").output
