@@ -1,8 +1,8 @@
 .idea
 **/.mypy_cache
-**/.mypy_cache
 .pytest_cache
 **/__pycache__
 *.iml
 *.html
 venv/
+/backup

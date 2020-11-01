@@ -2,6 +2,8 @@
 """
 Dead simple backup functionality.
 """
+from __future__ import annotations
+import configparser as ini
 import os
 import os.path as osp
 import re
@@ -9,46 +11,57 @@ import string
 import sys
 import tarfile
 import tempfile as tmp
-import configparser as ini
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from glob import iglob
 from heapq import merge
 from itertools import groupby
 from pathlib import Path
 from shutil import copy as fcopy, rmtree
 from traceback import format_stack
-from typing import Dict, Generator, Iterable, List, Set, Tuple
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    NoReturn,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import click
 from click import echo
 
-
 DIE_CODE = -1
 
 
-def die(msg):
+def die(msg) -> NoReturn:
     echo(msg, file=sys.stderr)
     sys.exit(DIE_CODE)
 
 
-def soft_assert(expr, msg):
+def soft_assert(expr: Any, msg: str) -> None:
     if not bool(expr):
         die(
             "The program has encountered an invalid state. "
             "Please report the following trace as an issue at "
             "https://github.com/qdbp/py9backup\nMessage:\n"
-            + msg + '\n' + format_stack()
+            + msg
+            + "\n"
+            + format_stack()
         )
 
 
-ALLOWABLE_CHARS = set(string.ascii_letters) | set(string.digits) | {'_'}
-CONFIG_DIR = Path('~/.config/py9backup/').expanduser()
+ALLOWABLE_CHARS = set(string.ascii_letters) | set(string.digits) | {"_"}
+CONFIG_DIR = Path("~/.config/py9backup/").expanduser()
 
 
-def load_settings():
-    settings_fn = CONFIG_DIR.joinpath('settings.ini')
+def load_settings() -> ini.ConfigParser:
+    settings_fn = CONFIG_DIR.joinpath("settings.ini")
     settings_fn.touch()
 
     parser = ini.ConfigParser()
@@ -58,100 +71,163 @@ def load_settings():
 
 
 @lru_cache(maxsize=1 << 10)
-def is_segment_glob(segment: str):
-    return bool(re.search(r'(?<!\\)\*', segment))
+def is_glob(segment: str):
+    return bool(re.search(r"(?<!\\)\*", segment))
 
 
-def gop_prio(path: str) -> int:
+def is_fs_ancestor(candidate: str, path: str):
     """
-    Calculates the priority of a glob or path.
+    Checks whether a candidate is a file system prefix of path.
+
+    A file system prefix is either the file itself, or an
+    Args:
+        candidate:
+        path:
 
     Returns:
-         the number of non-glob path segments in the path.
-
-    Args:
-        path: path or glob
+        True iff candidate is an ancestor of 'path' (including if candidate
+        == path)
 
     """
-    if path == '/':
+
+    candidate = candidate.rstrip("/")
+    path = path.rstrip("/")
+
+    return osp.commonpath((candidate, path)) == candidate
+
+
+def calc_raw_path_priority(path: str) -> int:
+    """
+    Calculates the relative_priority of a glob or str.
+
+    Returns:
+         the number of non-glob str segments in the str.
+
+    Args:
+        path: str or glob
+
+    """
+    if path == "/":
         return 0
-    segments = path.strip('/').split('/')
-    return sum([1 - int(is_segment_glob(s)) for s in segments])
+    segments = path.strip("/").split("/")
+    return sum([1 - int(is_glob(s)) for s in segments])
 
 
-def path_depth(path: str) -> int:
-    return path.strip('/').count('/')
+@dataclass(frozen=True, order=False)
+class ReducedPath:
+    """
+    Class representing simple file-system paths, with additional metadata.
+
+    These cannot be globes (hence 'reduced'). These can, however, be either
+    "included" or "exluded", the semantics of which is determined by the path
+    enumeration algorithm.
+
+    For the same reason, ReducedPaths also have a relative_priority
+    corresponding to their specificity.
+
+    """
+
+    path: str
+    # this is a relative priority value -- if this path was expanded from a glob
+    # its net priority will be lower than that of a path that was fully
+    # specified initially for the purposes of resolving the set of paths from
+    # multiple RichPaths.
+    _rel_prio: Optional[int]
+    excl: bool
+
+    @cached_property
+    def depth(self) -> int:
+        return self.path.strip("/").count("/")
+
+    @cached_property
+    def rel_prio(self) -> int:
+        return self._rel_prio if self._rel_prio is not None else self.depth
+
+    @cached_property
+    def priority(self) -> Tuple[int, str, int]:
+        return self.depth, self.path, self.rel_prio
 
 
 class RichPath:
     """
-    A path or collection of paths with some metadata related to backup
+    A str or collection of paths with some metadata related to backup
     functionality.
     """
 
     _FLAGS_LEN = 5
     _FLAGS = [
-        (0, 'x', 'exclude'),
-        (1, '?', 'sticky'),
-        (2, 'g', 'is_glob'),
+        (0, "x", "exclude"),
+        (1, "?", "sticky"),
+        (2, "g", "is_glob"),
     ]
 
     @classmethod
-    def parse(cls, raw_line):
-        flags = raw_line[:cls._FLAGS_LEN]
-        path = raw_line[cls._FLAGS_LEN + 1:].strip()
+    def parse(cls, raw_line: str) -> RichPath:
+        flags = raw_line[: cls._FLAGS_LEN]
+        path = raw_line[cls._FLAGS_LEN + 1 :].strip()
 
-        fdict = {}
+        flag_dict = {}
         for ix, char, kwarg in cls._FLAGS:
             if flags[ix] == char:
-                fdict[kwarg] = True
+                flag_dict[kwarg] = True
 
-        return cls(path, **fdict)
+        return cls(path, **flag_dict)
 
     @property
-    def path(self):
+    def str(self) -> str:
         if self.is_glob:
-            raise ValueError('A glob-type RichPath has no single path')
+            raise ValueError("A glob-type RichPath has no single str")
         else:
             return self.raw_entry
 
-    def sorted_iter_prio_path(self) -> \
-            Generator[Tuple[int, str, int, bool], None, None]:
+    def iter_reduced(
+        self,
+    ) -> Generator[ReducedPath, None, None]:
         """
-        Generates the paths of this RP according to their priority.
+        Generates the reduced paths of this RP according to their net priority.
+
+        Priority is defined by these two rules:
+            - specific beats general
+            - files beat directories
 
         Yields:
-            Tuples of the form (path_depth, path, glob_prio, is_include)
+            ReducePaths, ordered by their net relative_priority.
             suitable for inclusion in order.
         """
 
-        iincl = not self.exclude
-        gop = self.raw_entry
+        raw = self.raw_entry
 
-        # if the segment is not a glob, treat it like a regular path
-        # with glob priority equal to its depth (thus overriding any globs
-        # that also match it)
-        if not is_segment_glob(gop):
-            yield (path_depth(gop), gop, path_depth(gop), iincl)
+        # if the segment is not a glob, the reduced path is just the raw path
+        # with the rp's exclude value.
+        if not is_glob(raw):
+            yield ReducedPath(raw, None, self.exclude)
             return
+        # otherwise, there are multiple reduced paths at play
         else:
-            glob_prio = gop_prio(gop)
-            yield from iter(sorted([
-                (path_depth(path), path, glob_prio, iincl)
-                for path in iglob(gop, recursive=True)
-            ]))
+            rel_prio = calc_raw_path_priority(raw)
+            yield from sorted(
+                [
+                    ReducedPath(expanded, rel_prio, self.exclude)
+                    for expanded in iglob(raw, recursive=True)
+                ],
+                key=lambda reduced: reduced.priority,
+            )
 
-    def __init__(self, path_str, *, exclude=False,
-                 sticky=False, is_glob=False):
+    def __init__(
+        self, path_str: str, *, exclude=False, sticky=False, is_glob=False
+    ) -> None:
+
         """
-        Arguments:
+        Args:
+            path_str:
+                the file path on disk this rp maps to
             exclude:
-                mark the file or path as being excluded rather than included.
+                mark the file or str as being excluded rather than included.
             sticky:
-                mark the file or path to persist in the database even if it
+                mark the file or str to persist in the database even if it
                 does not exist.
             is_glob:
-                mark the path as a glob to be expanded at gather time.
+                mark the str as a glob to be expanded at gather time.
         """
 
         self.exclude = exclude
@@ -160,45 +236,71 @@ class RichPath:
 
         self.raw_entry = Path(path_str).expanduser().absolute().as_posix()
 
-    def __eq__(self, other):
+    def __eq__(self, other: RichPath) -> bool:
         return self.raw_entry == other.raw_entry
 
-    def __lt__(self, other):
+    def __lt__(self, other: RichPath) -> bool:
         if self.is_glob ^ other.is_glob:
             return self.is_glob
         else:
             return self.raw_entry < other.raw_entry
 
-    def __str__(self):
-        base = [' '] * (self._FLAGS_LEN + 1)
+    def __str__(self) -> str:
+        base = [" "] * (self._FLAGS_LEN + 1)
         for ix, char, kwarg in self._FLAGS:
             if getattr(self, kwarg):
                 base[ix] = char
 
-        return ''.join(base) + str(self.raw_entry)
+        return "".join(base) + str(self.raw_entry)
 
-    # include only the path in the hash, so that the same path with
+    # include only the str in the hash, so that the same str with
     # different flags will intentionally collide in sets/dicts. This
     # makes overwriting the flags easy and enforces a uniqueness invariant.
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self.raw_entry)
 
+    @staticmethod
+    def reduce_many(
+        rps: Iterable[RichPath],
+    ) -> Generator[ReducedPath, None, None]:
+        """
+        Reduces multiple RichPaths into a sequence of ReducedPaths, ordered
+        by priority, defined as
+            (depth, raw_path, rel_prio).
 
-def canonicalize_group_name(group):
+        In the case of multiple ReducedPath instances with the same fs path,
+        the one with the highest [internal_prio] is taken. This means that,
+        for instance, if both
+            /home/foo/*/baz
+        and /home/foo/important/baz
+
+        are specified independently, then /home/foo/important/baz will appear
+        in the output only once with an internal priority of 4
+        (i.e. 4 non-glob segments)
+        """
+
+        by_prio: Iterable[ReducedPath] = merge(
+            *(rp.iter_reduced() for rp in rps),
+            key=lambda reduced: reduced.priority,
+        )
+
+        for _, group in groupby(by_prio, key=lambda reduced: reduced.path):
+            yield sorted(group, key=lambda reduced: reduced.rel_prio)[-1]
+
+
+def canonicalize_group_name(group: str) -> str:
     group = group.lower()
     if set(group) - ALLOWABLE_CHARS:
-        die('Illegal characters in group name.')
+        die("Illegal characters in group name.")
     return group
 
 
 def get_backup_fp(fp: Path) -> Path:
-    return Path(fp.parent).joinpath('.' + fp.stem + '.bkp')
+    return Path(fp.parent).joinpath("." + fp.stem + ".bkp")
 
 
 def get_group_manifest_file(
-        group: str,
-        need_exist=True,
-        check_backup=True
+    group: str, need_exist=True, check_backup=True
 ) -> Path:
     """
     Get the path of the file storing the backup manifest for the group.
@@ -212,15 +314,16 @@ def get_group_manifest_file(
 
     group = canonicalize_group_name(group)
 
-    fp = CONFIG_DIR.joinpath(f'{group}.txt')
+    fp = CONFIG_DIR.joinpath(f"{group}.txt")
     fp_bkp = get_backup_fp(fp)
 
     # conditions not met
     if not fp.exists():
-        print('foooooooxxx', fp_bkp.exists())
         if check_backup and fp_bkp.exists():
-            msg = f'The group "{group}" was not found, but a backup file '\
-                + 'was. Would you like to restore the backup file?'
+            msg = (
+                f'The group "{group}" was not found, but a backup file '
+                + "was. Would you like to restore the backup file?"
+            )
 
             if click.confirm(msg, default=True):
                 fcopy(fp_bkp.as_posix(), fp.as_posix())
@@ -233,16 +336,29 @@ def get_group_manifest_file(
 
 
 def get_group_rps(
-        group: str,
-        need_exist=False,
+    group: str,
+    need_exist=False,
 ) -> List[RichPath]:
+    """
+    Get the list of rich paths corresponding to a group. This is distinct from
+    getting the complete list of actual file paths on disk.
+
+    Args:
+        group: the name of the group to read
+        need_exist: whether it is an error if the group does not exist.
+
+    Returns:
+        A list of RichPath objects stored in the group. This is empty if the
+        group does not and need not exist.
+
+    """
 
     fp = get_group_manifest_file(group, need_exist=need_exist)
 
     if not fp.exists():
         return []
     else:
-        with fp.open('r') as f:
+        with fp.open("r") as f:
             return [RichPath.parse(line) for line in f]
 
 
@@ -256,17 +372,16 @@ def commit_group_rps(group: str, rps: Iterable[RichPath]) -> None:
     """
 
     fp = get_group_manifest_file(group, need_exist=False, check_backup=False)
-    tfd, tfn = tmp.mkstemp(text=True)
     fp_bkp = get_backup_fp(fp)
 
     # if the file already exists, back it up
     if fp.exists() and fp.stat().st_size > 0:
         fcopy(str(fp), str(fp_bkp))
 
-    with tmp.NamedTemporaryFile(mode='w') as tf:
+    with tmp.NamedTemporaryFile(mode="w") as tf:
         for rp in sorted(set(rps)):
-            if rp.is_glob or rp.sticky or osp.exists(rp.path):
-                tf.write(str(rp) + '\n')
+            if rp.is_glob or rp.sticky or osp.exists(rp.str):
+                tf.write(str(rp) + "\n")
 
         tf.flush()
         fcopy(tf.name, str(fp))
@@ -278,64 +393,55 @@ def commit_group_rps(group: str, rps: Iterable[RichPath]) -> None:
 
 def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
     """
-    Converts a collection of include/exclude paths to a minimal collection
+    Resolves a collection of rich paths paths to a minimal collection
     of include-only paths.
     """
 
     # sort all paths by depth
-    included_by_depth: Dict[int, Set[str]] = defaultdict(set)
+    effective_by_depth: Dict[int, Set[str]] = defaultdict(set)
 
-    def get_highest_prio_by_depth():
+    rdp: ReducedPath
+    for rdp in RichPath.reduce_many(rps):
 
-        all_by_prio = merge(*[rp.sorted_iter_prio_path() for rp in rps])
+        # exclusions force explicit expansion in each level above them
+        if rdp.excl:
+            # so for each depth starting from the root, we find the entry at
+            # that depth that is a prefix of the path we are excluding and
+            # we split it up. Then we recurse.
+            for dx in range(rdp.depth):
 
-        for key, group in groupby(all_by_prio, key=lambda z: z[:2]):
+                for candidate_prefix in effective_by_depth[dx]:
 
-            highest_prio = None
-            for x in group:
-                highest_prio = x
+                    # non-prefixes of the excluded path are ignored
+                    if not is_fs_ancestor(candidate_prefix, rdp.path):
+                        continue
 
-            yield highest_prio
-
-    root_depth = None
-
-    for cur_depth, cur_path, _, is_incl in get_highest_prio_by_depth():
-
-        # get the highest we need to look in loop
-        if root_depth is None:
-            root_depth = cur_depth
-
-        if not is_incl:
-            # exclusions force explicit expansion in each level above them
-            for dx in range(root_depth, cur_depth):
-                prefix = None
-                for candidate_prefix in included_by_depth[dx]:
-                    if cur_path.startswith(candidate_prefix):
-                        prefix = candidate_prefix
-                        break
-                if prefix is None:
-                    continue
-
-                # remove higher-level path in favour of fragments
-                included_by_depth[dx].remove(prefix)
-                included_by_depth[dx + 1] |= \
-                    {str(x) for x in Path(prefix).iterdir()}
+                    # remove higher-level str in favour of fragments
+                    effective_by_depth[dx].remove(candidate_prefix)
+                    effective_by_depth[dx + 1] |= {
+                        str(x) for x in Path(candidate_prefix).iterdir()
+                    }
+                    break
 
             # exclude actual exclusion
-            included_by_depth[cur_depth].discard(cur_path)
+            effective_by_depth[rdp.depth].discard(rdp.path)
 
         else:
             # exclude redundant paths
             # this only works because of depth sorting in outer loop!
-            for dx in range(root_depth, cur_depth):
-                if any([cur_path.startswith(p)
-                        for p in included_by_depth[dx]]):
+            for dx in range(rdp.depth):
+                if any(
+                    [
+                        is_fs_ancestor(p, rdp.path)
+                        for p in effective_by_depth[dx]
+                    ]
+                ):
                     break
             else:
-                included_by_depth[cur_depth].add(cur_path)
+                effective_by_depth[rdp.depth].add(rdp.path)
 
     out: Set[str] = set()
-    for fns in included_by_depth.values():
+    for fns in effective_by_depth.values():
         out |= fns
 
     return sorted(out)
@@ -345,7 +451,7 @@ def gather_effective_files(rps: Iterable[RichPath]) -> List[str]:
 
 
 @click.group()
-def main():
+def main() -> None:
     """
     Tracks files to be backed up, on a per-group basis.
 
@@ -353,37 +459,42 @@ def main():
     behaving string which serves as an identifier for the collection of paths
     added. This allows different backup flow for different files.
     """
-    pass
 
 
-@main.command(name='add')
-@click.argument('group', nargs=1)
-@click.argument('paths', nargs=-1)
+@main.command(name="add")
+@click.argument("group", nargs=1)
+@click.argument("paths", nargs=-1)
 @click.option(
-    '--allow-nx', is_flag=True, default=False,
+    "--allow-nx",
+    is_flag=True,
+    default=False,
     help=(
-        'Allows nonexistent entries and persists them until explicit '
-        'deletion. Otherwise, nonexistent entries are dropped.'
-    )
+        "Allows nonexistent entries and persists them until explicit "
+        "deletion. Otherwise, nonexistent entries are dropped."
+    ),
 )
 @click.option(
-    '--exclude', is_flag=True, default=False,
+    "--exclude",
+    is_flag=True,
+    default=False,
     help=(
-        'Excludes the file or path. Overrides more general inclusions. '
-        'Overriden by more specific inclusions.'
-    )
+        "Excludes the file or str. Overrides more general inclusions. "
+        "Overriden by more specific inclusions."
+    ),
 )
 @click.option(
-    '--glob/--no-glob', is_flag=True, default=None,
+    "--glob/--no-glob",
+    is_flag=True,
+    default=None,
     help=(
-        'If true, the path will be interpreted as a glob. If false, it '
-        'will be interpreted literally. If unset, the path will be '
+        "If true, the str will be interpreted as a glob. If false, it "
+        "will be interpreted literally. If unset, the str will be "
         'treated as a glob iff it contains an unescaped "*".'
-    )
+    ),
 )
-def add_files(group, paths, *, exclude, allow_nx, glob):
+def add_files(group: str, paths: Iterable[str], *, exclude, allow_nx, glob):
     """
-    Adds a path to be tracked under a group.
+    Adds a str to be tracked under a group.
     """
     group = canonicalize_group_name(group)
     rps = set(get_group_rps(group))
@@ -392,12 +503,12 @@ def add_files(group, paths, *, exclude, allow_nx, glob):
     for path in paths:
 
         if glob is None:
-            glob = is_segment_glob(path)
+            glob = is_glob(path)
 
         if not (allow_nx or osp.isfile(path) or osp.isdir(path) or glob):
             echo(
                 f'Path "{path}" does not exist. Ignoring. '
-                'Pass --allow-nx to force persistent inclusion.'
+                "Pass --allow-nx to force persistent inclusion."
             )
             continue
 
@@ -409,68 +520,70 @@ def add_files(group, paths, *, exclude, allow_nx, glob):
     commit_group_rps(group, rps)
 
 
-@main.command('show')
-@click.argument('group')
+@main.command("show")
+@click.argument("group")
 @click.option(
-    '--full', is_flag=True, default=False,
-    help='show every included file explicitly',
+    "--full",
+    is_flag=True,
+    default=False,
+    help="show every included file explicitly",
 )
-def show_files(group, *, full):
+def show_files(group: str, *, full) -> None:
     """
     Shows all tracked paths for group.
     """
     rps = get_group_rps(group, need_exist=True)
     if not full:
         for rp in rps:
-            echo(' ' + str(rp))
+            echo(" " + str(rp))
     else:
         for fn in gather_effective_files(rps):
-            echo('\t' + fn)
+            echo("\t" + fn)
 
 
-@main.command(name='del')
-@click.argument('group')
-@click.argument('regex')
-def del_files(group, regex):
+@main.command(name="del")
+@click.argument("group")
+@click.argument("regex")
+def del_files(group: str, regex: str):
     """
     Removes files from group by regex.
 
     Python's `re.match` is used, so the regexp should match from the
-    beginning of the path. Use ^.* or similar.
+    beginning of the str. Use ^.* or similar.
     """
 
-    if regex == '.' and click.confirm(
-            '"del ." will delete every file in the group. Did you intend to '
-            'delete the current directory instead?',
-                default=True):
+    if regex == "." and click.confirm(
+        '"del ." will delete every file in the group. Did you intend to '
+        "delete the current directory instead?",
+        default=True,
+    ):
         regex = os.getcwd()
-    elif regex == '..' and click.confirm(
+    elif regex == ".." and click.confirm(
         '"del .." will likely delete every file in the group. Did you'
-        'intend to delete the current directory instead?',
-            default=True):
+        "intend to delete the current directory instead?",
+        default=True,
+    ):
         regex = str(Path(os.getcwd()).parent)
 
-    regex.rstrip('/')
-
-    print(regex)
+    regex.rstrip("/")
 
     path_reg = re.compile(regex)
     rps = get_group_rps(group)
 
     keep_rps = [rp for rp in rps if not path_reg.search(str(rp))]
-
-    print(keep_rps)
-
     commit_group_rps(group, keep_rps)
 
 
 @main.command()
-@click.argument('group')
-@click.argument('commands', nargs=-1)
+@click.argument("group")
+@click.argument("commands", nargs=-1)
 @click.option(
-    '--no-xz', default=False, is_flag=True, help='turn off xz compression',
+    "--no-xz",
+    default=False,
+    is_flag=True,
+    help="turn off xz compression",
 )
-@click.option('--name', default=None, help='name to use for the tarball')
+@click.option("--name", default=None, help="name to use for the tarball")
 def pull(group, commands, *, no_xz, name) -> None:
     """
     Pulls files into tarball, runs given commands on it.
@@ -487,91 +600,94 @@ def pull(group, commands, *, no_xz, name) -> None:
     """
 
     if name is None:
-        name = f'backup_{group}_{date.today().isoformat()}'
+        name = f"backup_{group}_{date.today().isoformat()}"
 
-    tar_mode = 'w' if no_xz else 'w:xz'
-    suf = 'tar' if no_xz else 'tar.xz'
+    tar_mode = "w" if no_xz else "w:xz"
+    suf = "tar" if no_xz else "tar.xz"
 
     file_paths = gather_effective_files(get_group_rps(group, need_exist=True))
 
     if len(file_paths) == 0 and not click.confirm(
-            f'Group {group} is empty. Continue?', default=False):
+        f"Group {group} is empty. Continue?", default=False
+    ):
         return
 
     temp_dir = tmp.mkdtemp()
-    tar_fn = osp.join(temp_dir, f'{name}.{suf}')
+    tar_fn = osp.join(temp_dir, f"{name}.{suf}")
 
     with tarfile.open(tar_fn, tar_mode) as tar:
         for path in file_paths:
             try:
                 tar.add(path.strip())
             except FileNotFoundError:
-                echo(f'File {path} not found, skipping.', file=sys.stderr)
+                echo(f"File {path} not found, skipping.", file=sys.stderr)
             except PermissionError:
-                die(f'File {path} needs elevated permissions. Dying.')
+                die(f"File {path} needs elevated permissions. Dying.")
 
     if not commands:
         settings = load_settings()
         try:
-            commands = [settings['py9backup']['default_pull_command']]
+            commands = [settings["py9backup"]["default_pull_command"]]
             click.echo(
-                'Running default pull commands:\n\t' + '\n\t'.join(commands)
+                "Running default pull commands:\n\t" + "\n\t".join(commands)
             )
         except KeyError:
             commands = []
 
     for com in commands:
-        com = re.sub(r'{}', tar_fn, com)
+        com = re.sub(r"{}", tar_fn, com)
         os.system(com)
 
     rmtree(temp_dir, ignore_errors=True)
 
 
-@main.command('list')
-def list_groups():
+@main.command("list")
+def list_groups() -> None:
     """
     List known groups.
     """
-    for path in sorted(Path(CONFIG_DIR).glob('*.txt')):
+    for path in sorted(Path(CONFIG_DIR).glob("*.txt")):
         echo(path.stem)
 
 
 @main.command()
-@click.argument('group')
-@click.option('--drop-backup', default=False, help='also forgets the backup')
-def forget(group, drop_backup):
+@click.argument("group")
+@click.option("--drop-backup", default=False, help="also forgets the backup")
+def forget(group: str, drop_backup: bool):
     """
     Deletes the registry file for a group. Unless that file itself is
     backed up (as is recommended), this cannot be undone.
     """
 
-    def render_lines(lines):
+    def render_lines(lines: List[str]) -> str:
         if len(lines) < 3:
-            out = '\n'.join(lines)
+            out = "\n".join(lines)
         else:
-            out = '\n'.join([lines[0], '...', lines[-1]])
-        return '\n' + out + '\n'
+            out = "\n".join([lines[0], "...", lines[-1]])
+        return "\n" + out + "\n"
 
     group_path = get_group_manifest_file(group, need_exist=True)
     backup_file = get_backup_fp(group_path)
 
     prompted = False
-    for file_in_question in\
-            [group_path] + ([backup_file] if drop_backup else []):
+    for file_in_question in [group_path] + (
+        [backup_file] if drop_backup else []
+    ):
 
         if not file_in_question.exists():
             continue
 
-        with file_in_question.open('r') as f:
+        with file_in_question.open("r") as f:
             lines = f.readlines()
 
-        backup_str =\
-            '(backup file)' if file_in_question == backup_file else ''
+        backup_str = "(backup file)" if file_in_question == backup_file else ""
         if not prompted:
             if lines and not click.confirm(
-                f'Confirm deletion of group {group} {backup_str} containing '
-                + f'{len(lines)} lines' + render_lines(lines),
-                    default=False):
+                f"Confirm deletion of group {group} {backup_str} containing "
+                + f"{len(lines)} lines"
+                + render_lines(lines),
+                default=False,
+            ):
                 return
             prompted = True
 
@@ -579,10 +695,10 @@ def forget(group, drop_backup):
 
 
 @main.command()
-@click.argument('group', type=str)
-@click.argument('newname', type=str)
+@click.argument("group", type=str)
+@click.argument("newname", type=str)
 @click.pass_context
-def rename(ctx, group, newname):
+def rename(ctx, group: str, new_name: str):
 
     group = canonicalize_group_name(group)
     fp = get_group_manifest_file(group, need_exist=False)
@@ -590,27 +706,29 @@ def rename(ctx, group, newname):
     if not fp.exists():
         die('Group "{group}" does not exist')
 
-    newname = canonicalize_group_name(newname)
-    new_fp = get_group_manifest_file(newname, need_exist=False)
+    new_name = canonicalize_group_name(new_name)
+    new_fp = get_group_manifest_file(new_name, need_exist=False)
 
     if not new_fp.exists() or click.confirm(
-        f'Group name "{newname}" already exists. Overwrite? Warning: '
-            f'overwrite will also destroy backup for "{newname}"',
-            default=False):
+        f'Group name "{new_name}" already exists. Overwrite? Warning: '
+        f'overwrite will also destroy backup for "{new_name}"',
+        default=False,
+    ):
 
-        ctx.invoke(forget, group=newname, drop_backup=True)
+        ctx.invoke(forget, group=new_name, drop_backup=True)
 
         get_backup_fp(fp).rename(get_backup_fp(new_fp))
         fp.rename(new_fp)
 
 
-if __name__ == '__main__':
-
+if __name__ == "__main__":
+    # noinspection PyBroadException
     try:
         CONFIG_DIR.mkdir(exist_ok=True)
     except Exception:
-        die(f'Unable to create config directory at {CONFIG_DIR}')
+        die(f"Unable to create config directory at {CONFIG_DIR}")
 
+    # noinspection PyBroadException
     try:
         main()
     except Exception:
@@ -620,6 +738,7 @@ if __name__ == '__main__':
             "The program has encountered an invalid state.\n"
             "Please report the following trace as an issue at "
             "https://github.com/qdbp/py9backup:\n"
-            + '\n' + format_exc()
+            + "\n"
+            + format_exc()
             + "\nI apologize for the inconvenience."
         )
