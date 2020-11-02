@@ -34,7 +34,7 @@ from typing import (
 )
 
 import click
-from click import echo
+from click import Choice, echo
 
 DIE_CODE = -1
 
@@ -581,10 +581,16 @@ def del_files(group: str, regex: str):
     "--no-xz",
     default=False,
     is_flag=True,
-    help="turn off xz compression",
+    help="turn off compression",
+)
+@click.option(
+    "--compalgo",
+    default="gz",
+    help="compression algorithm to use",
+    type=Choice(["xz", "bz2", "gz"], case_sensitive=False),
 )
 @click.option("--name", default=None, help="name to use for the tarball")
-def pull(group, commands, *, no_xz, name) -> None:
+def pull(group, commands, *, no_xz, name, compalgo: str) -> None:
     """
     Pulls files into tarball, runs given commands on it.
 
@@ -602,8 +608,8 @@ def pull(group, commands, *, no_xz, name) -> None:
     if name is None:
         name = f"backup_{group}_{date.today().isoformat()}"
 
-    tar_mode = "w" if no_xz else "w:xz"
-    suf = "tar" if no_xz else "tar.xz"
+    tar_mode = "w" if no_xz else f"w:{compalgo}"
+    suf = "tar" if no_xz else f"tar.{compalgo}"
 
     file_paths = gather_effective_files(get_group_rps(group, need_exist=True))
 
